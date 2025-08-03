@@ -709,7 +709,7 @@ enum StatusCode mfrc522_picc_halt_a(const struct device *dev) {
 			    &mfrc522_data_##inst,				\
 			    &mfrc522_config_##inst,				\
 			    POST_KERNEL,					\
-			    CONFIG_RFID_INIT_PRIORITY,			\
+			    CONFIG_MFRC522_INIT_PRIORITY,			\
 			    NULL);
 
 DT_INST_FOREACH_STATUS_OKAY(MFRC522_DEVICE_INIT)

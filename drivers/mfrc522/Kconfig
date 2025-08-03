@@ -7,6 +7,12 @@ menuconfig MFRC522
 
 if MFRC522
 
+config MFRC522_INIT_PRIORITY
+	int "MFRC522 devices init priority"
+	default 85
+	help
+	  MFRC522 devices initialization priority.
+
 module = MFRC522
 module-str = mfrc522
 source "subsys/logging/Kconfig.template.log_config"
