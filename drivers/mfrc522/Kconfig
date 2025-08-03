@@ -1,0 +1,14 @@
+menuconfig MFRC522
+	bool "MFRC522 RFID reader/writer"
+	default n
+	depends on SPI && GPIO
+	help
+	  Enable driver for MFRC522 RFID reader/writer.
+
+if MFRC522
+
+module = MFRC522
+module-str = mfrc522
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # MFRC522

@@ -1,0 +1,22 @@
+# MFRC522 RFID reader/writer binding
+
+description: NXP MFRC522 RFID reader/writer
+
+compatible: "nxp,mfrc522"
+
+include: [spi-device.yaml]
+
+properties:
+  reset-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      GPIO connected to the MFRC522 reset pin.
+      Active low (asserting the pin will perform a reset).
+
+  irq-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      GPIO connected to the MFRC522 IRQ pin. 
+      Optional, can be used for interrupt-driven operation.
