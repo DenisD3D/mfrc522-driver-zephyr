@@ -5,7 +5,7 @@ This library is a zephyr port of MFRC522 Arduino library: https://github.com/mig
 ## Usage
 
 In `west.yml`:
-```toml
+```yaml
 manifest:
   ...
   projects:
