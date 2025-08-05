@@ -397,10 +397,15 @@ enum StatusCode mfrc522_pcd_communicate_with_picc(const struct device *dev,
 }
 
 
-void mfrc522_pcd_set_register_bitmask(const struct device *dev, enum PCD_Register reg, uint8_t mask) {
+int mfrc522_pcd_set_register_bitmask(const struct device *dev, enum PCD_Register reg, uint8_t mask) {
     uint8_t tmp;
-    mfrc522_read_reg(dev, reg, &tmp);
-    mfrc522_write_reg(dev, reg, tmp | mask);  // set bit mask
+    int ret = mfrc522_read_reg(dev, reg, &tmp);
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = mfrc522_write_reg(dev, reg, tmp | mask); // set bit mask
+    return ret;
 }
 
 enum StatusCode mfrc522_picc_select(const struct device *dev, struct Uid *uid, uint8_t valid_bits) {
@@ -690,6 +695,245 @@ enum StatusCode mfrc522_picc_halt_a(const struct device *dev) {
     }
 
     return result;
+}
+
+void mfrc522_pcd_antenna_off(const struct device *dev) {
+    mfrc522_pcd_clear_register_bitmask(dev, TxControlReg, 0x03);
+}
+
+int mfrc522_pcd_get_antenna_gain(const struct device *dev, uint8_t *gain) {
+    uint8_t value;
+    int ret = mfrc522_read_reg(dev, RFCfgReg, &value);
+    if (ret < 0) {
+        return ret;
+    }
+
+    *gain = value & (0x07 << 4);
+    return 0;
+}
+
+int mfrc522_pcd_set_antenna_gain(const struct device *dev, uint8_t mask) {
+    uint8_t current_gain;
+    int ret = mfrc522_pcd_get_antenna_gain(dev, &current_gain);
+    if (ret < 0) {
+        return ret;
+    }
+
+    if (current_gain != mask) {  // only bother if there is a change
+        // clear needed to allow 000 pattern
+        ret = mfrc522_pcd_clear_register_bitmask(dev, RFCfgReg, (0x07 << 4));
+        if (ret < 0) {
+            return ret;
+        }
+
+        // only set RxGain[2:0] bits
+        ret = mfrc522_pcd_set_register_bitmask(dev, RFCfgReg, mask & (0x07 << 4));
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    return 0;
+}
+
+int mfrc522_pcd_reset(const struct device *dev) {
+    int ret = mfrc522_write_reg(dev, CommandReg, PCD_SoftReset);  // Issue the SoftReset command
+    if (ret < 0) {
+        return ret;
+    }
+
+    // The datasheet does not mention how long the SoftReset command takes to complete.
+    // But the MFRC522 might have been in soft power-down mode (triggered by bit 4 of CommandReg)
+    // Section 8.8.2 in the datasheet says the oscillator start-up time is the start up time of the crystal + 37,74μs. Let us be generous: 50ms.
+    uint8_t count = 0;
+    do {
+        // Wait for the PowerDown bit in CommandReg to be cleared (max 3x50ms)
+        k_sleep(K_MSEC(50));
+
+        uint8_t command_reg;
+        ret = mfrc522_read_reg(dev, CommandReg, &command_reg);
+        if (ret < 0) {
+            return ret;
+        }
+
+        if (!(command_reg & (1 << 4))) {  // PowerDown bit cleared
+            break;
+        }
+    } while ((++count) < 3);
+
+    if (count >= 3) {
+        return -ETIMEDOUT;  // Device didn't come out of power-down mode
+    }
+
+    return 0;
+}
+
+int mfrc522_pcd_soft_power_down(const struct device *dev) {
+    uint8_t val;
+    int ret = mfrc522_read_reg(dev, CommandReg, &val);  // Read state of the command register
+    if (ret < 0) {
+        return ret;
+    }
+
+    val |= (1 << 4);  // set PowerDown bit (bit 4) to 1
+    return mfrc522_write_reg(dev, CommandReg, val);  // write new value to the command register
+}
+
+int mfrc522_pcd_soft_power_up(const struct device *dev) {
+    uint8_t val;
+    int ret = mfrc522_read_reg(dev, CommandReg, &val);  // Read state of the command register
+    if (ret < 0) {
+        return ret;
+    }
+
+    val &= ~(1 << 4);  // set PowerDown bit (bit 4) to 0
+    ret = mfrc522_write_reg(dev, CommandReg, val);  // write new value to the command register
+    if (ret < 0) {
+        return ret;
+    }
+
+    // wait until PowerDown bit is cleared (this indicates end of wake up procedure)
+    int64_t timeout = k_uptime_get() + 500;  // create timer for timeout (just in case)
+
+    while (k_uptime_get() <= timeout) {  // set timeout to 500 ms
+        ret = mfrc522_read_reg(dev, CommandReg, &val);  // Read state of the command register
+        if (ret < 0) {
+            return ret;
+        }
+
+        if (!(val & (1 << 4))) {  // if powerdown bit is 0
+            break;  // wake up procedure is finished
+        }
+
+        k_yield();
+    }
+
+    if (val & (1 << 4)) {  // PowerDown bit still set after timeout
+        return -ETIMEDOUT;
+    }
+
+    return 0;
+}
+
+enum StatusCode mfrc522_pcd_authenticate(const struct device *dev, uint8_t command, uint8_t block_addr,
+                                          const uint8_t *key, const struct Uid *uid) {
+    uint8_t wait_irq = 0x10;  // IdleIRq
+
+    // Build command buffer
+    uint8_t send_data[12];
+    send_data[0] = command;
+    send_data[1] = block_addr;
+
+    for (uint8_t i = 0; i < MF_KEY_SIZE; i++) {  // 6 key bytes
+        send_data[2 + i] = key[i];
+    }
+
+    // Use the last uid bytes as specified in http://cache.nxp.com/documents/application_note/AN10927.pdf
+    // section 3.2.5 "MIFARE Classic Authentication".
+    // The only missed case is the MF1Sxxxx shortcut activation,
+    // but it requires cascade tag (CT) byte, that is not part of uid.
+    for (uint8_t i = 0; i < 4; i++) {  // The last 4 bytes of the UID
+        send_data[8 + i] = uid->uid_byte[i + uid->size - 4];
+    }
+
+    // Start the authentication
+    return mfrc522_pcd_communicate_with_picc(dev, PCD_MFAuthent, wait_irq, send_data, sizeof(send_data),
+                                              NULL, NULL, NULL, 0, false);
+}
+
+void mfrc522_pcd_stop_crypto1(const struct device *dev) {
+    // Clear MFCrypto1On bit
+    mfrc522_pcd_clear_register_bitmask(dev, Status2Reg, 0x08);  // Status2Reg[7..0] bits are: TempSensClear I2CForceHS reserved reserved MFCrypto1On ModemState[2:0]
+}
+
+enum StatusCode mfrc522_mifare_read(const struct device *dev, uint8_t block_addr, uint8_t *buffer, uint8_t *buffer_size) {
+    enum StatusCode result;
+
+    // Sanity check
+    if (buffer == NULL || *buffer_size < 18) {
+        return STATUS_NO_ROOM;
+    }
+
+    // Build command buffer
+    buffer[0] = PICC_CMD_MF_READ;
+    buffer[1] = block_addr;
+    // Calculate CRC_A
+    result = mfrc522_pcd_calculate_crc(dev, buffer, 2, &buffer[2]);
+    if (result != STATUS_OK) {
+        return result;
+    }
+
+    // Transmit the buffer and receive the response, validate CRC_A.
+    return mfrc522_pcd_transceive_data(dev, buffer, 4, buffer, buffer_size, NULL, 0, true);
+}
+
+enum StatusCode mfrc522_pcd_mifare_transceive(const struct device *dev, const uint8_t *send_data, uint8_t send_len,
+                                               bool accept_timeout) {
+    enum StatusCode result;
+    uint8_t cmd_buffer[18];  // We need room for 16 bytes data and 2 bytes CRC_A.
+
+    // Sanity check
+    if (send_data == NULL || send_len > 16) {
+        return STATUS_INVALID;
+    }
+
+    // Copy send_data[] to cmd_buffer[] and add CRC_A
+    memcpy(cmd_buffer, send_data, send_len);
+    result = mfrc522_pcd_calculate_crc(dev, cmd_buffer, send_len, &cmd_buffer[send_len]);
+    if (result != STATUS_OK) {
+        return result;
+    }
+    send_len += 2;
+
+    // Transceive the data, store the reply in cmd_buffer[]
+    uint8_t wait_irq = 0x30;  // RxIRq and IdleIRq
+    uint8_t cmd_buffer_size = sizeof(cmd_buffer);
+    uint8_t valid_bits = 0;
+    result = mfrc522_pcd_communicate_with_picc(dev, PCD_Transceive, wait_irq, cmd_buffer, send_len,
+                                               cmd_buffer, &cmd_buffer_size, &valid_bits, 0, false);
+    if (accept_timeout && result == STATUS_TIMEOUT) {
+        return STATUS_OK;
+    }
+    if (result != STATUS_OK) {
+        return result;
+    }
+
+    // The PICC must reply with a 4 bit ACK
+    if (cmd_buffer_size != 1 || valid_bits != 4) {
+        return STATUS_ERROR;
+    }
+    if (cmd_buffer[0] != MF_ACK) {
+        return STATUS_MIFARE_NACK;
+    }
+
+    return STATUS_OK;
+}
+
+enum StatusCode mfrc522_mifare_write(const struct device *dev, uint8_t block_addr, const uint8_t *buffer, uint8_t buffer_size) {
+    enum StatusCode result;
+
+    // Sanity check
+    if (buffer == NULL || buffer_size < 16) {
+        return STATUS_INVALID;
+    }
+
+    // Mifare Classic protocol requires two communications to perform a write.
+    // Step 1: Tell the PICC we want to write to block block_addr.
+    uint8_t cmd_buffer[2];
+    cmd_buffer[0] = PICC_CMD_MF_WRITE;
+    cmd_buffer[1] = block_addr;
+    result = mfrc522_pcd_mifare_transceive(dev, cmd_buffer, 2, false);  // Adds CRC_A and checks that the response is MF_ACK.
+    if (result != STATUS_OK) {
+        return result;
+    }
+
+    // Step 2: Transfer the data
+    result = mfrc522_pcd_mifare_transceive(dev, buffer, 16, false);  // Adds CRC_A and checks that the response is MF_ACK.
+    if (result != STATUS_OK) {
+        return result;
+    }
+
+    return STATUS_OK;
 }
 
 /* Define driver API (can be expanded as needed) */

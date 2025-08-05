@@ -166,8 +166,9 @@ enum StatusCode mfrc522_pcd_communicate_with_picc(const struct device *dev, uint
  * @param dev Pointer to the device structure
  * @param reg Register address
  * @param mask Bitmask to set
+ * @return 0 if successful, negative errno code on failure
  */
-void mfrc522_pcd_set_register_bitmask(const struct device *dev, enum PCD_Register reg, uint8_t mask);
+int mfrc522_pcd_set_register_bitmask(const struct device *dev, enum PCD_Register reg, uint8_t mask);
 
 /**
  * @brief Transmits SELECT/ANTICOLLISION commands to select a single PICC
@@ -227,5 +228,151 @@ bool mfrc522_picc_read_card_serial(const struct device *dev, struct Uid *uid);
  * @return STATUS_OK on success, STATUS_??? otherwise.
  */
 enum StatusCode mfrc522_picc_halt_a(const struct device *dev);
+
+/**
+ * @brief Turns the antenna off by disabling pins TX1 and TX2.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ */
+void mfrc522_pcd_antenna_off(const struct device *dev);
+
+/**
+ * @brief Get the current MFRC522 Receiver Gain (RxGain[2:0]) value.
+ *
+ * See 9.3.3.6 / table 98 in http://www.nxp.com/documents/data_sheet/MFRC522.pdf
+ * NOTE: Return value scrubbed with (0x07<<4)=01110000b as RCFfgReg may use reserved bits.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @param gain Pointer to store the RxGain value, scrubbed to the 3 bits used.
+ * @return 0 if successful, negative errno code on failure.
+ */
+int mfrc522_pcd_get_antenna_gain(const struct device *dev, uint8_t *gain);
+
+/**
+ * @brief Set the MFRC522 Receiver Gain (RxGain) to value specified by given mask.
+ *
+ * See 9.3.3.6 / table 98 in http://www.nxp.com/documents/data_sheet/MFRC522.pdf
+ * NOTE: Given mask is scrubbed with (0x07<<4)=01110000b as RCFfgReg may use reserved bits.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @param mask The gain mask to set, scrubbed to the 3 bits used.
+ * @return 0 if successful, negative errno code on failure.
+ */
+int mfrc522_pcd_set_antenna_gain(const struct device *dev, uint8_t mask);
+
+/**
+ * @brief Performs a soft reset on the MFRC522 chip and waits for it to be ready again.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @return 0 if successful, negative errno code on failure.
+ */
+int mfrc522_pcd_reset(const struct device *dev);
+
+/**
+ * @brief Enter soft power down mode by setting PowerDown bit in CommandReg.
+ *
+ * NOTE: Only soft power down mode is available through software.
+ * Calling any other function that uses CommandReg will disable soft power down mode.
+ * For more details about power control, refer to the datasheet - page 33 (8.6).
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @return 0 if successful, negative errno code on failure.
+ */
+int mfrc522_pcd_soft_power_down(const struct device *dev);
+
+/**
+ * @brief Exit soft power down mode by clearing PowerDown bit in CommandReg.
+ *
+ * Waits until PowerDown bit is cleared, indicating the end of wake up procedure.
+ * For more details about power control, refer to the datasheet - page 33 (8.6).
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @return 0 if successful, negative errno code on failure.
+ */
+int mfrc522_pcd_soft_power_up(const struct device *dev);
+
+/**
+ * @brief Executes the MFRC522 MFAuthent command.
+ *
+ * This command manages MIFARE authentication to enable a secure communication to any MIFARE Mini, MIFARE 1K and MIFARE 4K card.
+ * The authentication is described in the MFRC522 datasheet section 10.3.1.9 and http://www.nxp.com/documents/data_sheet/MF1S503x.pdf section 10.1.
+ * For use with MIFARE Classic PICCs.
+ * The PICC must be selected - ie in state ACTIVE(*) - before calling this function.
+ * Remember to call mfrc522_pcd_stop_crypto1() after communicating with the authenticated PICC - otherwise no new communications can start.
+ *
+ * All keys are set to FFFFFFFFFFFFh at chip delivery.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @param command PICC_CMD_MF_AUTH_KEY_A or PICC_CMD_MF_AUTH_KEY_B
+ * @param block_addr The block number
+ * @param key Pointer to the Crypto1 key to use (6 bytes)
+ * @param uid Pointer to Uid struct. The first 4 bytes of the UID is used.
+ * @return STATUS_OK on success, STATUS_??? otherwise. Probably STATUS_TIMEOUT if you supply the wrong key.
+ */
+enum StatusCode mfrc522_pcd_authenticate(const struct device *dev, uint8_t command, uint8_t block_addr,
+                                          const uint8_t *key, const struct Uid *uid);
+
+/**
+ * @brief Used to exit the PCD from its authenticated state.
+ *
+ * Remember to call this function after communicating with an authenticated PICC - otherwise no new communications can start.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ */
+void mfrc522_pcd_stop_crypto1(const struct device *dev);
+
+/**
+ * @brief Reads 16 bytes (+ 2 bytes CRC_A) from the active PICC.
+ *
+ * For MIFARE Classic the sector containing the block must be authenticated before calling this function.
+ *
+ * For MIFARE Ultralight only addresses 00h to 0Fh are decoded.
+ * The MF0ICU1 returns a NAK for higher addresses.
+ * The MF0ICU1 responds to the READ command by sending 16 bytes starting from the page address defined by the command argument.
+ * For example; if blockAddr is 03h then pages 03h, 04h, 05h, 06h are returned.
+ * A roll-back is implemented: If blockAddr is 0Eh, then the contents of pages 0Eh, 0Fh, 00h and 01h are returned.
+ *
+ * The buffer must be at least 18 bytes because a CRC_A is also returned.
+ * Checks the CRC_A before returning STATUS_OK.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @param block_addr MIFARE Classic: The block (0-0xff) number. MIFARE Ultralight: The first page to return data from.
+ * @param buffer The buffer to store the data in
+ * @param buffer_size Buffer size, at least 18 bytes. Also number of bytes returned if STATUS_OK.
+ * @return STATUS_OK on success, STATUS_??? otherwise.
+ */
+enum StatusCode mfrc522_mifare_read(const struct device *dev, uint8_t block_addr, uint8_t *buffer, uint8_t *buffer_size);
+
+/**
+ * @brief Wrapper for MIFARE protocol communication.
+ *
+ * Adds CRC_A, executes the Transceive command and checks that the response is MF_ACK or a timeout.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @param send_data Pointer to the data to transfer to the FIFO. Do NOT include the CRC_A.
+ * @param send_len Number of bytes in send_data.
+ * @param accept_timeout True => A timeout is also success
+ * @return STATUS_OK on success, STATUS_??? otherwise.
+ */
+enum StatusCode mfrc522_pcd_mifare_transceive(const struct device *dev, const uint8_t *send_data, uint8_t send_len,
+                                               bool accept_timeout);
+
+/**
+ * @brief Writes 16 bytes to the active PICC.
+ *
+ * For MIFARE Classic the sector containing the block must be authenticated before calling this function.
+ *
+ * For MIFARE Ultralight the operation is called "COMPATIBILITY WRITE".
+ * Even though 16 bytes are transferred to the Ultralight PICC, only the least significant 4 bytes (bytes 0 to 3)
+ * are written to the specified address. It is recommended to set the remaining bytes 04h to 0Fh to all logic 0.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @param block_addr MIFARE Classic: The block (0-0xff) number. MIFARE Ultralight: The page (2-15) to write to.
+ * @param buffer The 16 bytes to write to the PICC
+ * @param buffer_size Buffer size, must be at least 16 bytes. Exactly 16 bytes are written.
+ * @return STATUS_OK on success, STATUS_??? otherwise.
+ */
+enum StatusCode mfrc522_mifare_write(const struct device *dev, uint8_t block_addr, const uint8_t *buffer, uint8_t buffer_size);
+
 
 #endif /* DRIVERS_RFID_MFRC522_H_ */
